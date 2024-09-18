@@ -12,7 +12,7 @@ macOS and HiveOS.
 Discord discussions/issues: [here](https://discord.gg/cwfDZJ9dHx)
 
 Huge shoutout to https://github.com/KaffinPX/KStratum and
-https://github.com/astrix-network/nexellia-stratum-bridge and
+https://github.com/GRinvestPOOL/nexellia-stratum-bridge and
 https://github.com/rdugan/kaspa-stratum-bridge for the inspiration.
 
 Tips appreciated: `astrix:qqjzemurre653qvkxehfk4x2ngvdnzfusnyr85y8hu04gvq4jcv8q53frrp42`
