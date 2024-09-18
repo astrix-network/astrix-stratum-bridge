@@ -1,0 +1,3 @@
+{"level":"info","ts":"2024-09-17T20:47:33+02:00","msg":"hosting prom stats on :2114/metrics","server":"prometheus"}
+{"level":"info","ts":"2024-09-17T20:47:33+02:00","msg":"checking astrixd sync state","component":"astrixapi:localhost:34150"}
+{"level":"info","ts":"2024-09-17T20:47:33+02:00","msg":"astrixd synced, starting server","component":"astrixapi:localhost:34150"}

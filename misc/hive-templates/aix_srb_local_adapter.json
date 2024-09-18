@@ -1,0 +1,32 @@
+{
+    "isFavorite": false,
+    "items": [
+        {
+            "coin": "AIX",
+            "pool_ssl": false,
+            "dpool_ssl": false,
+            "miner": "srbminer",
+            "miner_config": {
+                "url": "127.0.0.1:5555",
+                "algo": "astrix",
+                "worker": "%WORKER_NAME%",
+                "user_config": "--disable-cpu"
+            },
+            "pool_geo": []
+        },
+        {
+            "coin": "AIX",
+            "pool_ssl": false,
+            "dpool_ssl": false,
+            "miner": "custom",
+            "miner_alt": "aix_bridge",
+            "miner_config": {
+                "url": "YOUR_ASTRIXD_NODE_IP_HERE:34150",
+                "miner": "aix_bridge",
+                "template": "doesnt.matter",
+                "install_url": "https://github.com/astrix-network/astrix-stratum-bridge/releases/download/v1.0.0/aix_bridge-1.0.0_hive.tar.gz"
+            },
+            "pool_geo": []
+        }
+    ]
+}
