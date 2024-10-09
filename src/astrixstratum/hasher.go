@@ -29,7 +29,7 @@ type astrixDiff struct {
 	targetValue *big.Int // previously know as fixedDifficultyBI
 }
 
-func newKarlsenDiff() *astrixDiff {
+func newAstrixDiff() *astrixDiff {
 	return &astrixDiff{}
 }
 
@@ -44,6 +44,14 @@ func DiffToTarget(diff float64) *big.Int {
 
 	t, _ := target.Int(nil)
 	return t
+}
+
+func TargetToDiff(target *big.Int) float64 {
+	targetFloat := new(big.Float).SetInt(target)
+	diff := new(big.Float).Quo(maxTarget, targetFloat)
+
+	diffFloat, _ := diff.Float64()
+	return diffFloat
 }
 
 func DiffToHash(diff float64) float64 {

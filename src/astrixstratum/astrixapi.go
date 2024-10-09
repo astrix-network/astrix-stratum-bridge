@@ -89,7 +89,7 @@ func (s *AstrixApi) waitForSync(verbose bool) error {
 		if clientInfo.IsSynced {
 			break
 		}
-		s.logger.Warn("Karlsen is not synced, waiting for sync before starting bridge")
+		s.logger.Warn("Astrix is not synced, waiting for sync before starting bridge")
 		time.Sleep(5 * time.Second)
 	}
 	if verbose {

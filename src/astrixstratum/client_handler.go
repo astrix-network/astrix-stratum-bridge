@@ -83,7 +83,7 @@ func (c *clientListener) OnDisconnect(ctx *gostratum.StratumContext) {
 	RecordDisconnect(ctx)
 }
 
-func (c *clientListener) NewBlockAvailable(kapi *AstrixApi) {
+func (c *clientListener) NewBlockAvailable(kapi *AstrixApi, soloMining bool) {
 	c.clientLock.Lock()
 	addresses := make([]string, 0, len(c.clients))
 	for _, cl := range c.clients {
@@ -125,18 +125,32 @@ func (c *clientListener) NewBlockAvailable(kapi *AstrixApi) {
 			if !state.initialized {
 				state.initialized = true
 				state.useBigJob = bigJobRegex.MatchString(client.RemoteApp)
-				// first pass through send the difficulty since it's fixed
-				state.stratumDiff = newKarlsenDiff()
+				// first pass through send config/default difficulty
+				state.stratumDiff = newAstrixDiff()
 				state.stratumDiff.setDiffValue(c.minShareDiff)
-				if err := client.Send(gostratum.JsonRpcEvent{
-					Version: "2.0",
-					Method:  "mining.set_difficulty",
-					Params:  []any{state.stratumDiff.diffValue},
-				}); err != nil {
-					RecordWorkerError(client.WalletAddr, ErrFailedSetDiff)
-					client.Logger.Error(errors.Wrap(err, "failed sending difficulty").Error(), zap.Any("context", client))
-					return
+				if !soloMining {
+					sendClientDiff(client, state)
 				}
+				c.shareHandler.setClientVardiff(client, c.minShareDiff)
+			}
+
+			varDiff := TargetToDiff(&state.bigDiff)
+			c.shareHandler.setSoloDiff(varDiff)
+			if !soloMining {
+				varDiff = c.shareHandler.getClientVardiff(client)
+			}
+
+			if varDiff == 0 {
+				varDiff = state.stratumDiff.diffValue
+			}
+			if varDiff != state.stratumDiff.diffValue {
+				// send updated vardiff
+				if !soloMining {
+					client.Logger.Info(fmt.Sprintf("changing diff from %.10f to %.10f", state.stratumDiff.diffValue, varDiff))
+				}
+				state.stratumDiff.setDiffValue(varDiff)
+				sendClientDiff(client, state)
+				c.shareHandler.startClientVardiff(client)
 			}
 
 			jobParams := []any{fmt.Sprintf("%d", jobId)}
@@ -144,7 +158,7 @@ func (c *clientListener) NewBlockAvailable(kapi *AstrixApi) {
 				jobParams = append(jobParams, GenerateLargeJobParams(header, uint64(template.Block.Header.Timestamp)))
 			} else {
 				jobParams = append(jobParams, GenerateJobHeader(header))
-				jobParams = append(jobParams, template.Block.Header.Timestamp)
+				jobParams = append(jobParams, uint64(template.Block.Header.Timestamp))
 			}
 
 			// // normal notify flow
@@ -185,3 +199,16 @@ func (c *clientListener) NewBlockAvailable(kapi *AstrixApi) {
 		}
 	}
 }
+
+func sendClientDiff(client *gostratum.StratumContext, state *MiningState) {
+	if err := client.Send(gostratum.JsonRpcEvent{
+		Version: "2.0",
+		Method:  "mining.set_difficulty",
+		Params:  []any{state.stratumDiff.diffValue},
+	}); err != nil {
+		RecordWorkerError(client.WalletAddr, ErrFailedSetDiff)
+		client.Logger.Error(errors.Wrap(err, "failed sending difficulty").Error(), zap.Any("context", client))
+		return
+	}
+}
+
