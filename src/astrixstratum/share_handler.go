@@ -3,6 +3,7 @@ package astrixstratum
 import (
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,19 +21,26 @@ import (
 	"go.uber.org/zap"
 )
 
+const varDiffThreadSleep = 10
+
 type WorkStats struct {
-	BlocksFound   atomic.Int64
-	SharesFound   atomic.Int64
-	SharesDiff    atomic.Float64
-	StaleShares   atomic.Int64
-	InvalidShares atomic.Int64
-	WorkerName    string
-	StartTime     time.Time
-	LastShare     time.Time
+	BlocksFound        atomic.Int64
+	SharesFound        atomic.Int64
+	SharesDiff         atomic.Float64
+	StaleShares        atomic.Int64
+	InvalidShares      atomic.Int64
+	WorkerName         string
+	StartTime          time.Time
+	LastShare          time.Time
+	VarDiffStartTime   time.Time
+	VarDiffSharesFound atomic.Int64
+	VarDiffWindow      int
+	MinDiff            atomic.Float64
 }
 
 type shareHandler struct {
 	astrix      *rpcclient.RPCClient
+	soloDiff     float64
 	stats        map[string]*WorkStats
 	statsLock    sync.Mutex
 	overall      WorkStats
@@ -143,7 +151,11 @@ func (sh *shareHandler) checkStales(ctx *gostratum.StratumContext, si *submitInf
 	return nil
 }
 
-func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostratum.JsonRpcEvent) error {
+func (sh *shareHandler) setSoloDiff(diff float64) {
+	sh.soloDiff = diff
+}
+
+func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostratum.JsonRpcEvent, soloMining bool) error {
 	submitInfo, err := validateSubmit(ctx, event)
 	if err != nil {
 		return err
@@ -160,6 +172,7 @@ func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostra
 
 	//ctx.Logger.Debug(submitInfo.block.Header.BlueScore, " submit ", submitInfo.noncestr)
 	state := GetMiningState(ctx)
+	
 	if state.useBigJob {
 		submitInfo.nonceVal, err = strconv.ParseUint(submitInfo.noncestr, 16, 64)
 		if err != nil {
@@ -174,22 +187,24 @@ func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostra
 		}
 	}
 	stats := sh.getCreateStats(ctx)
-	// if err := sh.checkStales(ctx, submitInfo); err != nil {
-	// 	if err == ErrDupeShare {
-	// 		ctx.Logger.Info("dupe share "+submitInfo.noncestr, ctx.WorkerName, ctx.WalletAddr)
-	// 		atomic.AddInt64(&stats.StaleShares, 1)
-	// 		RecordDupeShare(ctx)
-	// 		return ctx.ReplyDupeShare(event.Id)
-	// 	} else if errors.Is(err, ErrStaleShare) {
-	// 		ctx.Logger.Info(err.Error(), ctx.WorkerName, ctx.WalletAddr)
-	// 		atomic.AddInt64(&stats.StaleShares, 1)
-	// 		RecordStaleShare(ctx)
-	// 		return ctx.ReplyStaleShare(event.Id)
-	// 	}
-	// 	// unknown error somehow
-	// 	ctx.Logger.Error("unknown error during check stales: ", err.Error())
-	// 	return ctx.ReplyBadShare(event.Id)
-	// }
+	if err := sh.checkStales(ctx, submitInfo); err != nil {
+		if err == ErrDupeShare {
+			ctx.Logger.Warn("duplicate share: "+submitInfo.noncestr)
+			RecordDupeShare(ctx)
+			stats.InvalidShares.Add(1)
+			sh.overall.InvalidShares.Add(1)
+			return ctx.ReplyDupeShare(event.Id)
+		} else if errors.Is(err, ErrStaleShare) {
+			ctx.Logger.Warn("stale share")
+			stats.StaleShares.Add(1)
+			sh.overall.StaleShares.Add(1)
+			RecordStaleShare(ctx)
+			return ctx.ReplyStaleShare(event.Id)
+		}
+		// unknown error somehow
+		ctx.Logger.Error("unknown error during check stales")
+		return ctx.ReplyBadShare(event.Id)
+	}
 
 	converted, err := appmessage.RPCBlockToDomainBlock(submitInfo.block)
 	if err != nil {
@@ -197,6 +212,7 @@ func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostra
 	}
 	mutableHeader := converted.Header.ToMutable()
 	mutableHeader.SetNonce(submitInfo.nonceVal)
+
 	powState := pow.NewState(mutableHeader)
 	powValue := powState.CalculateProofOfWorkValue()
 
@@ -205,15 +221,26 @@ func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostra
 		if err := sh.submit(ctx, converted, submitInfo.nonceVal, event.Id); err != nil {
 			return err
 		}
+	} else if powValue.Cmp(state.stratumDiff.targetValue) >= 0 {
+		if soloMining {
+			ctx.Logger.Warn("weak block")
+		} else {
+			ctx.Logger.Warn("weak share")
+		}
+		ctx.Logger.Warn(fmt.Sprintf("Net Target: %s\n", powState.Target.String()))
+		ctx.Logger.Warn(fmt.Sprintf("Stratum Target: %s\n", state.stratumDiff.targetValue.String()))
+		ctx.Logger.Warn(fmt.Sprintf("Stratum Target Hex: %064x\n", state.stratumDiff.targetValue.Bytes()))
+		ctx.Logger.Warn(fmt.Sprintf("Nonce: %d\n", submitInfo.nonceVal))
+		ctx.Logger.Warn(fmt.Sprintf("Nonce Hex: %016x\n", submitInfo.nonceVal))
+		ctx.Logger.Warn(fmt.Sprintf("PowValue: %064x\n", powValue.Bytes()))
+		stats.InvalidShares.Add(1)
+		sh.overall.InvalidShares.Add(1)
+		RecordWeakShare(ctx)
+		return ctx.ReplyLowDiffShare(event.Id)
 	}
-	// remove for now until I can figure it out. No harm here as we're not
-	// } else if powValue.Cmp(state.stratumDiff.targetValue) >= 0 {
-	// 	ctx.Logger.Warn("weak block")
-	// 	RecordWeakShare(ctx)
-	// 	return ctx.ReplyLowDiffShare(event.Id)
-	// }
 
 	stats.SharesFound.Add(1)
+	stats.VarDiffSharesFound.Add(1)
 	stats.SharesDiff.Add(state.stratumDiff.hashValue)
 	stats.LastShare = time.Now()
 	sh.overall.SharesFound.Add(1)
@@ -273,33 +300,207 @@ func (sh *shareHandler) startStatsThread() error {
 	for {
 		// console formatting is terrible. Good luck whever touches anything
 		time.Sleep(10 * time.Second)
-		sh.statsLock.Lock()
+
+		// don't like locking entire stats struct - risk should be negligible
+		// if mutex is ultimately needed, should move to one per client
+		// sh.statsLock.Lock()
+
 		str := "\n===============================================================================\n"
 		str += "  worker name   |  avg hashrate  |   acc/stl/inv  |    blocks    |    uptime\n"
 		str += "-------------------------------------------------------------------------------\n"
 		var lines []string
 		totalRate := float64(0)
+
 		for _, v := range sh.stats {
+			// print stats
 			rate := GetAverageHashrateGHs(v)
 			totalRate += rate
-			rateStr := fmt.Sprintf("%0.2fGH/s", rate) // todo, fix units
+			rateStr := stringifyHashrate(rate)
 			ratioStr := fmt.Sprintf("%d/%d/%d", v.SharesFound.Load(), v.StaleShares.Load(), v.InvalidShares.Load())
 			lines = append(lines, fmt.Sprintf(" %-15s| %14.14s | %14.14s | %12d | %11s",
 				v.WorkerName, rateStr, ratioStr, v.BlocksFound.Load(), time.Since(v.StartTime).Round(time.Second)))
 		}
 		sort.Strings(lines)
 		str += strings.Join(lines, "\n")
-		rateStr := fmt.Sprintf("%0.2fGH/s", totalRate) // todo, fix units
+		rateStr := stringifyHashrate(totalRate)
 		ratioStr := fmt.Sprintf("%d/%d/%d", sh.overall.SharesFound.Load(), sh.overall.StaleShares.Load(), sh.overall.InvalidShares.Load())
 		str += "\n-------------------------------------------------------------------------------\n"
-		str += fmt.Sprintf("                | %14.14s | %14.14s | %12d | %11s",
+		str += fmt.Sprintf(" Total          | %14.14s | %14.14s | %12d | %11s",
 			rateStr, ratioStr, sh.overall.BlocksFound.Load(), time.Since(start).Round(time.Second))
-		str += "\n========================================================= aix_bridge_" + version + " ===\n"
-		sh.statsLock.Unlock()
+		str += "\n-------------------------------------------------------------------------------\n"
+		str += " Est. Network Hashrate: " + stringifyHashrate(DiffToHash(sh.soloDiff))
+		str += "\n======================================================== aix_bridge_" + version + " ===\n"
+		// sh.statsLock.Unlock()
 		log.Println(str)
 	}
 }
 
 func GetAverageHashrateGHs(stats *WorkStats) float64 {
 	return stats.SharesDiff.Load() / time.Since(stats.StartTime).Seconds()
+}
+
+func stringifyHashrate(ghs float64) string {
+	unitStrings := [...]string{"", "K", "M", "G", "T", "P", "E", "Z", "Y"}
+	var unit string
+	var hr float64
+
+	if ghs*1000000 < 1 {
+		hr = ghs * 1000 * 1000 * 1000
+		unit = unitStrings[0]
+	} else if ghs * 1000 < 1 {
+		hr = ghs * 1000 * 1000
+		unit = unitStrings[1]
+	} else if ghs < 1 {
+		hr = ghs * 1000
+		unit = unitStrings[2]
+	} else if ghs < 1000 {
+		hr = ghs
+		unit = unitStrings[3]
+	} else {
+		for i, u := range unitStrings[4:] {
+			hr = ghs / (float64(i) * 1000)
+			if hr < 1000 {
+				break
+			}
+			unit = u
+		}
+	}
+
+	return fmt.Sprintf("%0.2f%sH/s", hr, unit)
+}
+
+func (sh *shareHandler) startVardiffThread(expectedShareRate uint, logStats bool) error {
+	// 15 shares/min allows a ~95% confidence assumption of:
+	//   < 100% variation after 1m
+	//   < 50% variation after 3m
+	//   < 25% variation after 10m
+	//   < 15% variation after 30m
+	//   < 10% variation after 1h
+	//   < 5% variation after 4h
+	var windows = [...]uint{1, 3, 10, 30, 60, 240, 0}
+	var tolerances = [...]float64{1, 0.5, 0.25, 0.15, 0.1, 0.05, 0.05}
+
+	for {
+		time.Sleep(varDiffThreadSleep * time.Second)
+
+		// don't like locking entire stats struct - risk should be negligible
+		// if mutex is ultimately needed, should move to one per client
+		// sh.statsLock.Lock()
+
+		stats := "\n=== vardiff ===================================================================\n\n"
+		stats += "  worker name  |    diff     |  window  |  elapsed   |    shares   |   rate    \n"
+		stats += "-------------------------------------------------------------------------------\n"
+
+		var statsLines []string
+		var toleranceErrs []string
+
+		for _, v := range sh.stats {
+			if v.VarDiffStartTime.IsZero() {
+				// no vardiff sent to client
+				continue
+			}
+
+			worker := v.WorkerName
+			diff := v.MinDiff.Load()
+			shares := v.VarDiffSharesFound.Load()
+			duration := time.Since(v.VarDiffStartTime).Minutes()
+			shareRate := float64(shares) / duration
+			shareRateRatio := shareRate / float64(expectedShareRate)
+			window := windows[v.VarDiffWindow]
+			tolerance := tolerances[v.VarDiffWindow]
+
+			statsLines = append(statsLines, fmt.Sprintf(" %-14s| %11.2f | %8d | %10.2f | %11d | %9.2f", worker, diff, window, duration, shares, shareRate))
+
+			// check final stage first, as this is where majority of time spent
+			if window == 0 {
+				if math.Abs(1-shareRateRatio) >= tolerance {
+					// final stage submission rate OOB
+					toleranceErrs = append(toleranceErrs, fmt.Sprintf("%s final share rate (%f) exceeded tolerance (+/- %d%%)", worker, shareRate, int(tolerance*100)))
+					updateVarDiff(v, diff*shareRateRatio)
+				}
+				continue
+			}
+
+			// check all previously cleared windows
+			i := 1
+			for i < v.VarDiffWindow {
+				if math.Abs(1-shareRateRatio) >= tolerances[i] {
+					// breached tolerance of previously cleared window
+					toleranceErrs = append(toleranceErrs, fmt.Sprintf("%s share rate (%f) exceeded tolerance (+/- %d%%) for %dm window", worker, shareRate, int(tolerances[i]*100), windows[i]))
+					updateVarDiff(v, diff*shareRateRatio)
+					break
+				}
+				i++
+			}
+			if i < v.VarDiffWindow {
+				// should only happen if we broke previous loop
+				continue
+			}
+
+			// check for current window max exception
+			if float64(shares) >= float64(window*expectedShareRate)*(1+tolerance) {
+				// submission rate > window max
+				toleranceErrs = append(toleranceErrs, fmt.Sprintf("%s share rate (%f) exceeded upper tolerance (+ %d%%) for %dm window", worker, shareRate, int(tolerance*100), window))
+				updateVarDiff(v, diff*shareRateRatio)
+				continue
+			}
+
+			// check whether we've exceeded window length
+			if duration >= float64(window) {
+				// check for current window min exception
+				if float64(shares) <= float64(window*expectedShareRate)*(1-tolerance) {
+					// submission rate < window min
+					toleranceErrs = append(toleranceErrs, fmt.Sprintf("%s share rate (%f) exceeded lower tolerance (- %d%%) for %dm window", worker, shareRate, int(tolerance*100), window))
+					updateVarDiff(v, diff*math.Max(shareRateRatio, 0.1))
+					continue
+				}
+
+				v.VarDiffWindow++
+			}
+		}
+		sort.Strings(statsLines)
+		stats += strings.Join(statsLines, "\n")
+		stats += "\n\n======================================================== aix_bridge_" + version + " ===\n"
+		stats += strings.Join(toleranceErrs, "\n")
+		if logStats {
+			log.Println(stats)
+		}
+
+		// sh.statsLock.Unlock()
+	}
+}
+
+// update vardiff with new mindiff, reset counters, and disable tracker until
+// client handler restarts it while sending diff on next block
+func updateVarDiff(stats *WorkStats, minDiff float64) float64 {
+	stats.VarDiffStartTime = time.Time{}
+	stats.VarDiffWindow = 0
+	previousMinDiff := stats.MinDiff.Load()
+	stats.MinDiff.Store(minDiff)
+	return previousMinDiff
+}
+
+// (re)start vardiff tracker
+func startVarDiff(stats *WorkStats) {
+	if stats.VarDiffStartTime.IsZero() {
+		stats.VarDiffSharesFound.Store(0)
+		stats.VarDiffStartTime = time.Now()
+	}
+}
+
+func (sh *shareHandler) startClientVardiff(ctx *gostratum.StratumContext) {
+	stats := sh.getCreateStats(ctx)
+	startVarDiff(stats)
+}
+
+func (sh *shareHandler) getClientVardiff(ctx *gostratum.StratumContext) float64 {
+	stats := sh.getCreateStats(ctx)
+	return stats.MinDiff.Load()
+}
+
+func (sh *shareHandler) setClientVardiff(ctx *gostratum.StratumContext, minDiff float64) float64 {
+	stats := sh.getCreateStats(ctx)
+	previousMinDiff := updateVarDiff(stats, math.Max(minDiff, 0.00001))
+	startVarDiff(stats)
+	return previousMinDiff
 }
